@@ -43,6 +43,7 @@ class Config:
     oauth_client_id: str = ""
     oauth_client_secret: str = ""
     mpv_path: str = ""  # empty = locate on PATH
+    short_seek_seconds: int = 5
     seek_seconds: int = 10
     long_seek_seconds: int = 30
     search_limit: int = 15
@@ -64,6 +65,7 @@ def load_config() -> Config:
         oauth_client_id=str(oauth.get("client_id", "")),
         oauth_client_secret=str(oauth.get("client_secret", "")),
         mpv_path=str(mpv.get("path", "")),
+        short_seek_seconds=int(player.get("short_seek_seconds", 5)),
         seek_seconds=int(player.get("seek_seconds", 10)),
         long_seek_seconds=int(player.get("long_seek_seconds", 30)),
         search_limit=int(player.get("search_limit", 15)),
@@ -99,6 +101,7 @@ def write_config_sample() -> Path:
                 'path = ""',
                 "",
                 "[player]",
+                "short_seek_seconds = 5",
                 "seek_seconds = 10",
                 "long_seek_seconds = 30",
                 "search_limit = 15",

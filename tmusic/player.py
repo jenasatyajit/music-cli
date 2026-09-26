@@ -21,10 +21,10 @@ import threading
 import time
 
 from .errors import TmusicError
-from .logging import get_logger, log_exception
+from .logging import get_logger, log_exception, user_error_text
 from .models import Playback, State, Track
 from .mpv_backend import MPVBackend
-from .ytm import get_stream_url, library_songs, liked_songs, quick_picks, search, up_next
+from .ytm import get_stream_url, library_songs, liked_songs, quick_picks, rate_song, search, up_next
 
 log = get_logger("player")
 
@@ -157,6 +157,13 @@ class PlayerCore:
             return
         self._cmd_q.put(("up_next", target))
 
+    def toggle_like(self, track: Track | None = None) -> None:
+        target = track or self.playback.current
+        if not target or not target.video_id:
+            self._emit("message", "no track selected to like/unlike")
+            return
+        self._cmd_q.put(("toggle_like", target))
+
     # ------------------------------------------------------------------ worker
 
     def _emit(self, kind: str, *payload) -> None:
@@ -222,6 +229,8 @@ class PlayerCore:
             self._do_listing("quick_picks", "Quick picks")
         elif kind == "up_next":
             self._do_up_next(cmd[1])
+        elif kind == "toggle_like":
+            self._do_toggle_like(cmd[1])
 
     # ------------------------------------------------------------------ transitions
 
@@ -367,4 +376,33 @@ class PlayerCore:
         except TmusicError as e:
             log_exception(log, e, f"up_next failed for {track.title!r}")
             self._emit("error", e.description)
+        self.playback.status_message = ""
+
+    def _do_toggle_like(self, track: Track) -> None:
+        try:
+            # If already marked as LIKE, toggle to INDIFFERENT (unlike). Otherwise rate as LIKE.
+            new_status = "INDIFFERENT" if track.like_status == "LIKE" else "LIKE"
+            rate_song(self.client, track.video_id, new_status)
+            track.like_status = new_status
+            if self.playback.current and self.playback.current.video_id == track.video_id:
+                self.playback.current.like_status = new_status
+            for q_track in self.playback.queue:
+                if q_track.video_id == track.video_id:
+                    q_track.like_status = new_status
+
+            if new_status == "LIKE":
+                msg = f"♥ Liked: {track.title}"
+            else:
+                msg = f"♡ Unliked: {track.title}"
+            log.info("toggled like for %s -> %s", track.video_id, new_status)
+            self._emit("message", msg)
+            self._emit("like-changed", track.video_id, new_status)
+        except TmusicError as e:
+            log_exception(log, e, f"like toggle failed for {track.title!r}")
+            self._emit("error", e.description)
+        except Exception as e:
+            err = user_error_text(e)
+            log.warning("like toggle failed for %s: %s", track.video_id, e)
+            self._emit("message", f"like error: {err}")
+
         self.playback.status_message = ""

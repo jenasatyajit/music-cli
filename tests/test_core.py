@@ -214,3 +214,108 @@ def test_pick_audio_url_progressive_fallback():
     sd = {"formats": [{"mimeType": "audio/mp4", "url": "prog"}]}
     assert y._pick_audio_url(sd) == "prog"
     assert y._pick_audio_url({}) is None
+
+
+# ---------------------------------------------------------------- short seek
+
+def test_config_short_seek_seconds():
+    cfg = Config()
+    assert cfg.short_seek_seconds == 5
+    assert cfg.seek_seconds == 10
+    assert cfg.long_seek_seconds == 30
+
+
+def test_tui_short_seek_keys():
+    from unittest.mock import MagicMock
+    from tmusic.tui import TUIApp
+
+    mock_core = MagicMock()
+    mock_core.cfg = Config(short_seek_seconds=5)
+    app = TUIApp(core=mock_core, authed=False)
+
+    # Main mode
+    app._handle_key(ord("g"))
+    mock_core.seek.assert_called_with(-5)
+
+    app._handle_key(ord("h"))
+    mock_core.seek.assert_called_with(5)
+
+    # Cover mode
+    app.mode = "cover"
+    app._handle_key(ord("g"))
+    mock_core.seek.assert_called_with(-5)
+
+    app._handle_key(ord("h"))
+    mock_core.seek.assert_called_with(5)
+
+    # Results mode
+    app.mode = "results"
+    app._handle_key(ord("g"))
+    mock_core.seek.assert_called_with(-5)
+
+    app._handle_key(ord("h"))
+    mock_core.seek.assert_called_with(5)
+
+
+# ---------------------------------------------------------------- like / unlike
+
+def test_track_like_status_parsing():
+    t_liked = Track.from_ytm({"videoId": "abc", "videoType": "OMV", "title": "A", "likeStatus": "LIKE"})
+    assert t_liked.like_status == "LIKE"
+
+    t_from_liked_src = Track.from_ytm({"videoId": "def", "videoType": "OMV", "title": "B"}, source="liked")
+    assert t_from_liked_src.like_status == "LIKE"
+
+    t_unliked = Track.from_ytm({"videoId": "ghi", "videoType": "OMV", "title": "C", "likeStatus": "INDIFFERENT"})
+    assert t_unliked.like_status == "INDIFFERENT"
+
+
+def test_tui_shift_l_key():
+    from unittest.mock import MagicMock
+    from tmusic.tui import TUIApp
+
+    mock_core = MagicMock()
+    mock_track = Track(video_id="vid123", title="Song 1")
+    mock_core.snapshot.return_value.queue = [mock_track]
+    mock_core.snapshot.return_value.current = mock_track
+
+    app = TUIApp(core=mock_core, authed=True)
+
+    # Main mode (cursor at 0)
+    app.cursor = 0
+    app._handle_key(ord("L"))
+    mock_core.toggle_like.assert_called_with(mock_track)
+
+    # Cover mode
+    mock_core.toggle_like.reset_mock()
+    app.mode = "cover"
+    app._handle_key(ord("L"))
+    mock_core.toggle_like.assert_called_with(mock_track)
+
+    # Results mode
+    mock_core.toggle_like.reset_mock()
+    app.mode = "results"
+    res_track = Track(video_id="vid456", title="Song 2")
+    app.results = [res_track]
+    app.results_cursor = 0
+    app._handle_key(ord("L"))
+    mock_core.toggle_like.assert_called_with(res_track)
+
+
+def test_player_do_toggle_like():
+    from unittest.mock import MagicMock
+    from tmusic.player import PlayerCore
+
+    mock_client = MagicMock()
+    core = PlayerCore(cfg=Config(), client=mock_client)
+
+    track = Track(video_id="v1", title="Song", like_status="INDIFFERENT")
+    core._do_toggle_like(track)
+    assert track.like_status == "LIKE"
+    mock_client.rate_song.assert_called_with(videoId="v1", rating="LIKE")
+
+    # Toggle back
+    core._do_toggle_like(track)
+    assert track.like_status == "INDIFFERENT"
+    mock_client.rate_song.assert_called_with(videoId="v1", rating="INDIFFERENT")
+

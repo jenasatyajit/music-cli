@@ -384,4 +384,10 @@ def quick_picks(client: YTMusic, limit: int = 20) -> list[Track]:
         if tracks:
             return tracks[:limit]
 
-    return []
+    return []
+
+
+def rate_song(client: YTMusic, video_id: str, rating: str = "LIKE") -> dict | None:
+    """Rate a song: 'LIKE', 'INDIFFERENT' (removes rating / unlike), or 'DISLIKE'."""
+    return _call(client, "rate_song", videoId=video_id, rating=rating)
+

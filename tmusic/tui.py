@@ -210,6 +210,11 @@ class TUIApp:
                 self.flash(ev[1], 4.0)
             elif kind == "queue-changed":
                 self.flash("queue updated")
+            elif kind == "like-changed":
+                vid, nstatus = ev[1], ev[2]
+                for r in self.results:
+                    if r.video_id == vid:
+                        r.like_status = nstatus
 
     # ------------------------------------------------------------------ keys
 
@@ -229,6 +234,15 @@ class TUIApp:
                 return None
             elif key in (ord("p"),):
                 self.core.prev()
+                return None
+            elif key in (ord("L"),):
+                self.core.toggle_like(self.core.snapshot().current)
+                return None
+            elif key in (ord("g"), ord("G")):
+                self.core.seek(-self.core.cfg.short_seek_seconds)
+                return None
+            elif key in (ord("h"), ord("H")):
+                self.core.seek(self.core.cfg.short_seek_seconds)
                 return None
             elif key == curses.KEY_LEFT:
                 self.core.seek(-self.core.cfg.seek_seconds)
@@ -274,9 +288,13 @@ class TUIApp:
             self.prompt = ""
             self.prompt_scope = None
         elif key in (ord("L"),):
-            self.mode = "prompt"
-            self.prompt = ""
-            self.prompt_scope = "library"
+            pb = self.core.snapshot()
+            target = None
+            if pb.queue and 0 <= self.cursor < len(pb.queue):
+                target = pb.queue[self.cursor]
+            elif pb.current:
+                target = pb.current
+            self.core.toggle_like(target)
         elif key in (ord("l"),):
             self.core.list_library()
         elif key in (ord("r"), ord("R")):
@@ -289,6 +307,10 @@ class TUIApp:
             self.core.list_liked()
         elif key in (ord("?"),):
             self.mode = "help"
+        elif key in (ord("g"), ord("G")):
+            self.core.seek(-self.core.cfg.short_seek_seconds)
+        elif key in (ord("h"), ord("H")):
+            self.core.seek(self.core.cfg.short_seek_seconds)
         elif key == curses.KEY_LEFT:
             self.core.seek(-self.core.cfg.seek_seconds)
         elif key == curses.KEY_RIGHT:
@@ -360,6 +382,10 @@ class TUIApp:
             self.core.prev()
         elif key in (ord("x"),):
             self.core.stop()
+        elif key in (ord("g"), ord("G")):
+            self.core.seek(-self.core.cfg.short_seek_seconds)
+        elif key in (ord("h"), ord("H")):
+            self.core.seek(self.core.cfg.short_seek_seconds)
         elif key == curses.KEY_LEFT:
             self.core.seek(-self.core.cfg.seek_seconds)
         elif key == curses.KEY_RIGHT:
@@ -382,9 +408,10 @@ class TUIApp:
             self.prompt = ""
             self.prompt_scope = None
         elif key in (ord("L"),):
-            self.mode = "prompt"
-            self.prompt = ""
-            self.prompt_scope = "library"
+            if self.results and 0 <= self.results_cursor < len(self.results):
+                self.core.toggle_like(self.results[self.results_cursor])
+            else:
+                self.core.toggle_like(self.core.snapshot().current)
         elif key in (ord("r"), ord("R")):
             self.core.list_quick_picks()
         elif key in (ord("u"), ord("U")):
@@ -606,7 +633,7 @@ class TUIApp:
         _safe_write(stdscr, h - 3, bx, line, self.C_GREEN)
 
         state_str = "▶ PLAYING" if pb.state == State.PLAYING else ("⏸ PAUSED" if pb.state == State.PAUSED else "")
-        foot = f" {state_str}  ·  space=pause  n=next  p=prev  ←/→=seek  c/Esc=return "
+        foot = f" {state_str}  ·  space=pause  n=next  p=prev  L=like  g/h=±5s  ←/→=seek  c/Esc=return "
         _safe_write(stdscr, h - 1, max(0, (w - len(foot)) // 2), _clip(foot, w - 1), curses.A_DIM)
 
     def _draw_queue(self, stdscr, h: int, w: int) -> None:
@@ -635,8 +662,9 @@ class TUIApp:
                 if idx == self.cursor and self.cursor != pb.index:
                     attr = curses.A_REVERSE
                 dur_t = f"{fmt_time(t.duration_seconds)}" if t.duration_seconds else ""
+                heart = "♥ " if t.like_status == "LIKE" else ""
                 _safe_write(stdscr, qy + 1 + row, 0, f" {marker}", attr)
-                _safe_write(stdscr, qy + 1 + row, 3, _clip(t.label, list_w - 14), attr)
+                _safe_write(stdscr, qy + 1 + row, 3, _clip(f"{heart}{t.label}", list_w - 14), attr)
                 _safe_write(stdscr, qy + 1 + row, list_w - 9, dur_t, attr)
 
         if has_panel:
@@ -666,10 +694,11 @@ class TUIApp:
             marker = ">" if idx == self.results_cursor else " "
             attr = curses.A_REVERSE if idx == self.results_cursor else 0
             dur_t = f"{fmt_time(t.duration_seconds)}" if t.duration_seconds else ""
+            heart = "♥ " if t.like_status == "LIKE" else ""
             _safe_write(stdscr, ry + 1 + row, 0, f" {marker}", attr)
-            _safe_write(stdscr, ry + 1 + row, 3, _clip(t.label, list_w - 14), attr)
+            _safe_write(stdscr, ry + 1 + row, 3, _clip(f"{heart}{t.label}", list_w - 14), attr)
             _safe_write(stdscr, ry + 1 + row, list_w - 9, dur_t, attr)
-        _safe_write(stdscr, ry + list_h + 1, 0, _clip(" Enter=play s=play all a=add to queue esc=back", list_w - 1), curses.A_DIM)
+        _safe_write(stdscr, ry + list_h + 1, 0, _clip(" Enter=play s=play all a=add to queue L=like esc=back", list_w - 1), curses.A_DIM)
 
         if has_panel:
             self._draw_cover_panel(stdscr, h, w, w - panel_w - 1, panel_w, ry, list_h + 2)
@@ -684,7 +713,7 @@ class TUIApp:
         y = h - 1
         now = time.monotonic()
         status = self.status if now < self.status_until else ""
-        base = " space=pause n=next p=prev u=up-next r=picks c=cover ←/→=seek l=lib m=liked d=del ?=help q=quit"
+        base = " space=pause n=next p=prev u=up-next r=picks c=cover L=like g/h=±5s ←/→=seek l=lib m=liked d=del ?=help q=quit"
         if status:
             _safe_write(stdscr, y, 0, _clip(" " + status + "  ", w - len(base) - 1), self.C_YELLOW)
             _safe_write(stdscr, y, w - len(base), _clip(base, len(base)), curses.A_DIM)
@@ -698,17 +727,18 @@ class TUIApp:
             "  space / enter    play · pause",
             "  n · p            next · previous (p restarts track after 3s)",
             "  x                stop",
+            "  L                like · unlike song (Shift+L, current or selected)",
+            "  g / h            short seek 5s   (g backward · h forward)",
             "  ← / →            seek 10s        PgUp / PgDn  seek 30s",
             "  mouse click      seek (on the progress line)",
             "  c                view high-definition album cover art",
             "  /                search public catalogue",
-            "  L                search your library",
             "  u                load Up Next songs (radio for currently playing track)",
             "  r                load quick picks (recommendations)",
             "  l                load your library",
             "  m                load your liked songs",
             "  j / k or ↑ / ↓   move cursor     d  delete from queue",
-            "  in results: Enter play from here · s play all · a add to queue",
+            "  in results: Enter play from here · s play all · a add to queue · L like",
             "",
             "  ?                this help        q / esc  quit",
         ]

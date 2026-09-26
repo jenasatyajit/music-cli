@@ -65,6 +65,7 @@ Add `-v` / `-vv` for more logging. Details always in the log file.
 path = ""
 
 [player]
+short_seek_seconds = 5
 seek_seconds = 10
 long_seek_seconds = 30
 search_limit = 15

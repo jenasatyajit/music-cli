@@ -32,6 +32,7 @@ class Track:
     is_live: bool = False
     # context for "next in context" (watch playlist) — set by the service
     source: str = ""  # "search", "liked", "playlist:<id>", "radio"
+    like_status: str = ""  # "LIKE", "INDIFFERENT", "DISLIKE", or ""
 
     @property
     def label(self) -> str:
@@ -145,6 +146,10 @@ class Track:
             title = title.get("text") or title.get("name") or "?"
         title = str(title).strip() or "?"
 
+        like_status = str(item.get("likeStatus") or "")
+        if not like_status and source == "liked":
+            like_status = "LIKE"
+
         return cls(
             video_id=video_id,
             title=title,
@@ -153,6 +158,7 @@ class Track:
             duration_seconds=float(duration or 0.0),
             thumbnail_url=thumb,
             source=source,
+            like_status=like_status,
         )
 
 

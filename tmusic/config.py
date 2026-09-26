@@ -147,16 +147,40 @@ def read_token() -> dict | None:
 
 
 def find_mpv(cfg: Config) -> str:
-    """Resolve the mpv executable path; raises MissingMpv with a full trail."""
+    """Resolve the mpv executable path; raises MissingMpv with a full trail.
+
+    Windows: prefer an actual .exe — the shinchiro winget package also drops
+    an extensionless-style mpv.COM launcher, which we don't want to depend on.
+    """
     import shutil
 
     tried: list[str] = []
     if cfg.mpv_path:
         tried.append(cfg.mpv_path)
-        if Path(cfg.mpv_path).is_file() and os.access(cfg.mpv_path, os.X_OK):
+        if Path(cfg.mpv_path).is_file():
             return cfg.mpv_path
-    tried.append("PATH")
-    found = shutil.which("mpv")
-    if found:
-        return found
+
+    if sys.platform == "win32":
+        # explicit .exe first (PATH and common install locations)
+        exe = shutil.which("mpv.exe")
+        if exe:
+            return exe
+        tried.append("PATH (mpv.exe)")
+        for cand in (
+            r"C:\Program Files\MPV Player\mpv.exe",
+            r"C:\Program Files (x86)\MPV Player\mpv.exe",
+            str(Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "mpv" / "mpv.exe"),
+        ):
+            tried.append(cand)
+            if Path(cand).is_file():
+                return cand
+        # last resort: whatever `mpv` resolves to (may be .com / launcher)
+        found = shutil.which("mpv")
+        if found:
+            return found
+    else:
+        tried.append("PATH")
+        found = shutil.which("mpv")
+        if found:
+            return found
     raise MissingMpv(tried)

@@ -351,6 +351,14 @@ def watch_playlist(client: YTMusic, video_id: str, limit: int = 25) -> list[Trac
     return [t for t in (Track.from_ytm(it, source="context") for it in items) if t]
 
 
+def up_next(client: YTMusic, video_id: str, limit: int = 25, exclude_current: bool = True) -> list[Track]:
+    """Fetch the 'Up Next' recommended queue for a specific track from YouTube Music."""
+    tracks = watch_playlist(client, video_id=video_id, limit=limit + 1)
+    if exclude_current and tracks and tracks[0].video_id == video_id:
+        return tracks[1 : limit + 1]
+    return tracks[:limit]
+
+
 def quick_picks(client: YTMusic, limit: int = 20) -> list[Track]:
     """Fetch the user's personalized 'Quick picks' (or home recommendations)."""
     home = _call(client, "get_home", limit=8)

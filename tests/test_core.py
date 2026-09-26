@@ -60,6 +60,88 @@ def test_track_from_ytm_song():
     assert t.label == "Wonderwall — Oasis"
 
 
+def test_track_from_ytm_ytmusicapi_name_format():
+    item = {
+        "videoId": "xyz789",
+        "title": "Bohemian Rhapsody",
+        "artists": [{"name": "Queen", "id": "123"}],
+        "album": {"name": "A Night At The Opera", "id": "456"},
+        "duration_seconds": 355,
+    }
+    t = Track.from_ytm(item)
+    assert t is not None
+    assert t.artists == "Queen"
+    assert t.album == "A Night At The Opera"
+    assert t.label == "Bohemian Rhapsody — Queen"
+
+
+def test_track_from_ytm_multiple_artists_and_no_empty_commas():
+    item = {
+        "videoId": "aP8yml7kaWU",
+        "title": "Ishqa Ve",
+        "artists": [
+            {"name": "Zeeshan Ali", "id": "1"},
+            {"name": "Sandeep Aulakh", "id": "2"},
+            {"name": "Honey Dhillon", "id": "3"},
+        ],
+        "album": {"name": "Ishqa Ve", "id": "4"},
+    }
+    t = Track.from_ytm(item)
+    assert t is not None
+    assert t.artists == "Zeeshan Ali, Sandeep Aulakh, Honey Dhillon"
+    assert t.label == "Ishqa Ve — Zeeshan Ali, Sandeep Aulakh, Honey Dhillon"
+
+
+def test_track_from_ytm_no_artists_no_commas():
+    item = {
+        "videoId": "single123",
+        "title": "Solo Piano",
+        "artists": [],
+    }
+    t = Track.from_ytm(item)
+    assert t is not None
+    assert t.artists == ""
+    assert t.label == "Solo Piano"
+
+
+def test_track_duration_assignment():
+    t = Track(video_id="test1", title="Test Song", duration_seconds=0.0)
+    assert t.duration_seconds == 0.0
+    t.duration_seconds = 245.5
+    assert t.duration_seconds == 245.5
+
+
+def test_track_from_ytm_duration_string():
+    item1 = {"videoId": "v1", "title": "Track 1", "length": "3:16"}
+    t1 = Track.from_ytm(item1)
+    assert t1 is not None
+    assert t1.duration_seconds == 196.0
+
+    item2 = {"videoId": "v2", "title": "Track 2", "duration": "1:02:15"}
+    t2 = Track.from_ytm(item2)
+    assert t2 is not None
+    assert t2.duration_seconds == 3735.0
+
+
+def test_up_next_function():
+    from unittest.mock import MagicMock
+    from tmusic.ytm import up_next
+
+    mock_client = MagicMock()
+    mock_client.get_watch_playlist.return_value = {
+        "tracks": [
+            {"videoId": "v_seed", "title": "Seed Song", "length": "3:00"},
+            {"videoId": "v_next1", "title": "Next Song 1", "length": "4:00"},
+            {"videoId": "v_next2", "title": "Next Song 2", "length": "2:30"},
+        ]
+    }
+    res = up_next(mock_client, "v_seed", limit=10, exclude_current=True)
+    assert len(res) == 2
+    assert res[0].video_id == "v_next1"
+    assert res[1].video_id == "v_next2"
+    assert res[0].duration_seconds == 240.0
+
+
 def test_track_from_ytm_skips_live_and_garbage():
     assert Track.from_ytm({"videoId": "x", "isLive": True, "title": "live"}) is None
     assert Track.from_ytm({"title": "no id"}) is None

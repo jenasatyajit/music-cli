@@ -152,9 +152,9 @@ class TUIApp:
             return None
 
     def _mouse_to_key(self, my: int, mx: int, stdscr) -> int:
-        """Timeline click → seek; otherwise ignore."""
+        """Timeline click → seek; track list click → play."""
         h, w = stdscr.getmaxyx()
-        if my == 4 and self.mode == "main":
+        if my == 4 and self.mode in ("main", "results"):
             track = self.core.snapshot().current
             if track and track.duration_seconds > 0:
                 x0, x1 = 6, w - 8
@@ -163,6 +163,18 @@ class TUIApp:
                     target = frac * track.duration_seconds
                     delta = target - self.core.snapshot().position
                     self.core.seek(delta)
+        elif my >= 8 and self.mode == "main":
+            pb = self.core.snapshot()
+            idx = self.scroll + (my - 8)
+            if 0 <= idx < len(pb.queue):
+                self.cursor = idx
+                self.core.play_list(pb.queue, idx)
+        elif my >= 7 and self.mode == "results":
+            idx = self.scroll + (my - 7)
+            if 0 <= idx < len(self.results):
+                self.results_cursor = idx
+                self.core.play_list(self.results[idx:], 0)
+                self.mode = "main"
         return -1  # consumed, no action
 
     def _resize(self, stdscr) -> None:
@@ -241,7 +253,11 @@ class TUIApp:
             return "quit"
         elif key == 27:  # esc
             return "quit"
-        elif key in (ord(" "), 10):
+        elif key in (10, 13, curses.KEY_ENTER):
+            if pb.queue and 0 <= self.cursor < len(pb.queue):
+                # Enter plays the track currently highlighted by the cursor
+                self.core.play_list(pb.queue, self.cursor)
+        elif key == ord(" "):
             if pb.state in (State.IDLE, State.ERROR) and pb.queue:
                 # nothing playing (or errored) — start the queue at the cursor
                 self.core.play_list(pb.queue, self.cursor)
@@ -265,6 +281,8 @@ class TUIApp:
             self.core.list_library()
         elif key in (ord("r"), ord("R")):
             self.core.list_quick_picks()
+        elif key in (ord("u"), ord("U")):
+            self.core.list_up_next()
         elif key in (ord("c"), ord("C")):
             self.mode = "cover"
         elif key in (ord("m"),):
@@ -320,20 +338,63 @@ class TUIApp:
     def _key_results(self, key: int) -> str | None:
         if key in (27, 9, ord("q")):
             self.mode = "main"
+            return None
         elif key in (curses.KEY_UP, ord("k")):
             self.results_cursor = max(0, self.results_cursor - 1)
         elif key in (curses.KEY_DOWN, ord("j")):
             self.results_cursor = min(len(self.results) - 1, self.results_cursor + 1)
+        elif key == curses.KEY_PPAGE:
+            self.results_cursor = max(0, self.results_cursor - 5)
+        elif key == curses.KEY_NPAGE:
+            self.results_cursor = min(len(self.results) - 1, self.results_cursor + 5)
         elif key in (10, 13, curses.KEY_ENTER):
-            t = self.results[self.results_cursor]
-            # play this result as a queue starting at it
-            self.core.play_list(self.results[self.results_cursor:], 0)
-            self.mode = "main"
+            if self.results and 0 <= self.results_cursor < len(self.results):
+                # play this result as a queue starting at it
+                self.core.play_list(self.results[self.results_cursor:], 0)
+                self.mode = "main"
+        elif key == ord(" "):
+            self.core.toggle_pause()
+        elif key in (ord("n"),):
+            self.core.next()
+        elif key in (ord("p"),):
+            self.core.prev()
+        elif key in (ord("x"),):
+            self.core.stop()
+        elif key == curses.KEY_LEFT:
+            self.core.seek(-self.core.cfg.seek_seconds)
+        elif key == curses.KEY_RIGHT:
+            self.core.seek(self.core.cfg.seek_seconds)
+        elif key == 68:  # shift+left
+            self.core.seek(-self.core.cfg.long_seek_seconds)
+        elif key == 66:  # shift+right
+            self.core.seek(self.core.cfg.long_seek_seconds)
+        elif key in (ord("c"), ord("C")):
+            self.mode = "cover"
         elif key == ord("a"):
-            self.core.add_to_queue(self.results[self.results_cursor])
+            if self.results and 0 <= self.results_cursor < len(self.results):
+                self.core.add_to_queue(self.results[self.results_cursor])
         elif key == ord("s"):
-            self.core.play_list(self.results, self.results_cursor)
-            self.mode = "main"
+            if self.results and 0 <= self.results_cursor < len(self.results):
+                self.core.play_list(self.results, self.results_cursor)
+                self.mode = "main"
+        elif key in (ord("/"),):
+            self.mode = "prompt"
+            self.prompt = ""
+            self.prompt_scope = None
+        elif key in (ord("L"),):
+            self.mode = "prompt"
+            self.prompt = ""
+            self.prompt_scope = "library"
+        elif key in (ord("r"), ord("R")):
+            self.core.list_quick_picks()
+        elif key in (ord("u"), ord("U")):
+            self.core.list_up_next()
+        elif key in (ord("l"),):
+            self.core.list_library()
+        elif key in (ord("m"),):
+            self.core.list_liked()
+        elif key in (ord("?"),):
+            self.mode = "help"
         elif key == -1:
             pass
         return None
@@ -387,9 +448,14 @@ class TUIApp:
             else:
                 eq = " " * 12
             _safe_write(stdscr, y, 4, eq, self.C_MAG)
-            _safe_write(stdscr, y, 18, _clip(track.label, w - 22), curses.A_BOLD)
-            if track.album:
-                _safe_write(stdscr, y + 1, 18, _clip(track.album, w - 22), curses.A_DIM)
+            _safe_write(stdscr, y, 18, _clip(track.title, w - 22), curses.A_BOLD)
+            meta_parts = []
+            if track.artists:
+                meta_parts.append(f"by {track.artists}")
+            if track.album and track.album.lower() != track.title.lower():
+                meta_parts.append(track.album)
+            if meta_parts:
+                _safe_write(stdscr, y + 1, 18, _clip("  ·  ".join(meta_parts), w - 22), self.C_GREEN)
 
             # Trigger background cover fetch
             if track.video_id and track.video_id not in self._cover_cache and track.video_id not in self._cover_fetching:
@@ -467,6 +533,12 @@ class TUIApp:
             _safe_write(stdscr, py + row, px + pw - 1, "│", self.C_CYAN)
             row += 1
 
+        if track.album and row < max_h - 1 and track.album.lower() != track.title.lower():
+            _safe_write(stdscr, py + row, px, "│", self.C_CYAN)
+            _safe_write(stdscr, py + row, px + 2, _clip(track.album, text_w), curses.A_DIM)
+            _safe_write(stdscr, py + row, px + pw - 1, "│", self.C_CYAN)
+            row += 1
+
         # Pad remaining space
         while row < max_h - 1:
             _safe_write(stdscr, py + row, px, "│", self.C_CYAN)
@@ -493,14 +565,16 @@ class TUIApp:
             _safe_write(stdscr, h // 2, max(2, w // 2 - 14), "♪ No track currently playing", curses.A_DIM)
             return
 
+        avail_h = max(4, h - 8)
+        target_w = min(w - 6, max(44, avail_h * 2))
+
         art_lines = self._full_cover_cache.get(track.video_id, [])
         if not art_lines and track.video_id not in self._cover_fetching:
-            self._fetch_cover_async(track.video_id, track.thumbnail_url)
+            self._fetch_cover_async(track.video_id, track.thumbnail_url, full_width=target_w)
 
         art_w = len(art_lines[0]) if art_lines else 0
         art_h = len(art_lines)
 
-        avail_h = max(4, h - 8)
         draw_h = min(art_h, avail_h)
         start_y = max(2, (avail_h - draw_h) // 2 + 1)
         start_x = max(1, (w - art_w) // 2)
@@ -610,7 +684,7 @@ class TUIApp:
         y = h - 1
         now = time.monotonic()
         status = self.status if now < self.status_until else ""
-        base = " space=pause n=next p=prev r=picks c=cover ←/→=seek l=library m=liked d=del ?=help q=quit"
+        base = " space=pause n=next p=prev u=up-next r=picks c=cover ←/→=seek l=lib m=liked d=del ?=help q=quit"
         if status:
             _safe_write(stdscr, y, 0, _clip(" " + status + "  ", w - len(base) - 1), self.C_YELLOW)
             _safe_write(stdscr, y, w - len(base), _clip(base, len(base)), curses.A_DIM)
@@ -629,6 +703,7 @@ class TUIApp:
             "  c                view high-definition album cover art",
             "  /                search public catalogue",
             "  L                search your library",
+            "  u                load Up Next songs (radio for currently playing track)",
             "  r                load quick picks (recommendations)",
             "  l                load your library",
             "  m                load your liked songs",
@@ -644,7 +719,7 @@ class TUIApp:
         _safe_write(stdscr, y0 + len(rows) + 1, max(1, w // 2 - 20),
                     "(any key to close)", curses.A_DIM)
 
-    def _fetch_cover_async(self, video_id: str, url: str) -> None:
+    def _fetch_cover_async(self, video_id: str, url: str, full_width: int = 60) -> None:
         import threading
         from .cover import fetch_cover_bytes, render_curses_braille
 
@@ -655,7 +730,7 @@ class TUIApp:
                 data = fetch_cover_bytes(url, video_id=video_id)
                 if data:
                     self._cover_cache[video_id] = render_curses_braille(data, width=26)
-                    self._full_cover_cache[video_id] = render_curses_braille(data, width=44)
+                    self._full_cover_cache[video_id] = render_curses_braille(data, width=full_width)
             except Exception:
                 pass
             finally:
@@ -683,6 +758,8 @@ def run_tui(cfg) -> int:
     except TuiFatalError as e:
         print(f"error: {e.user_message}", file=sys.stderr)
         return 1
+    finally:
+        core.shutdown()
 
 
 class TuiFatalError(Exception):

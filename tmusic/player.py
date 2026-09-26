@@ -24,7 +24,7 @@ from .errors import TmusicError
 from .logging import get_logger, log_exception
 from .models import Playback, State, Track
 from .mpv_backend import MPVBackend
-from .ytm import get_stream_url, library_songs, liked_songs, quick_picks, search
+from .ytm import get_stream_url, library_songs, liked_songs, quick_picks, search, up_next
 
 log = get_logger("player")
 
@@ -53,15 +53,15 @@ class PlayerCore:
     def shutdown(self) -> None:
         self._running = False
         try:
-            self._cmd_q.put(("__shutdown__",))
-        except Exception:
-            pass
-        if self._worker:
-            self._worker.join(timeout=3)
-        try:
             self.backend.shutdown()
         except Exception:
             log_exception(log, Exception("backend shutdown failed"), "core.shutdown")
+        try:
+            self._cmd_q.put(("__shutdown__",))
+        except Exception:
+            pass
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=1.0)
 
     # ------------------------------------------------------------------ public API (UI thread)
 
@@ -150,6 +150,13 @@ class PlayerCore:
     def list_quick_picks(self) -> None:
         self._cmd_q.put(("quick_picks",))
 
+    def list_up_next(self, track: Track | None = None) -> None:
+        target = track or self.playback.current
+        if not target or not target.video_id:
+            self._emit("message", "no track playing — play a track first to see Up Next")
+            return
+        self._cmd_q.put(("up_next", target))
+
     # ------------------------------------------------------------------ worker
 
     def _emit(self, kind: str, *payload) -> None:
@@ -170,10 +177,15 @@ class PlayerCore:
             if self.playback.state in (State.PLAYING, State.PAUSED):
                 for ev in self.backend.drain_events():
                     if ev.event == "end-file":
-                        log.info("track ended: %s", self.playback.current)
-                        self._auto_next()
-                        break
-                    if ev.event == "error":
+                        # Only advance queue if track finished on its own (natural eof).
+                        # Ignore "stop", "replaced", "quit", etc. which happen when user skips/replaces.
+                        if ev.reason == "eof":
+                            log.info("track ended naturally (eof): %s", self.playback.current)
+                            self._auto_next()
+                            break
+                        else:
+                            log.debug("ignoring non-eof end-file event (reason=%s)", ev.reason)
+                    elif ev.event == "error":
                         self._set_error(f"playback error: {ev.reason}")
                     elif ev.event == "crash":
                         self._set_error("the audio engine crashed; restarting it")
@@ -208,6 +220,8 @@ class PlayerCore:
             self._do_listing("library_songs", "Your library")
         elif kind == "quick_picks":
             self._do_listing("quick_picks", "Quick picks")
+        elif kind == "up_next":
+            self._do_up_next(cmd[1])
 
     # ------------------------------------------------------------------ transitions
 
@@ -229,11 +243,18 @@ class PlayerCore:
         log.info("loading [%d/%d]: %s", index, len(pb.queue), track.label)
         try:
             url, duration = get_stream_url(self.client, track)
-            if track.duration_seconds <= 0:
-                track.duration_seconds = duration
+            if duration and track.duration_seconds <= 0:
+                try:
+                    track.duration_seconds = duration
+                except Exception:
+                    import dataclasses
+                    track = dataclasses.replace(track, duration_seconds=duration)
+                    pb.queue[index] = track
             if gen != self._load_gen:  # superseded by a newer command
                 log.info("load superseded, dropping")
                 return
+            # Drain any stale events from previously playing/stopped tracks
+            self.backend.drain_events()
             self.backend.play(url, seek=0.0)
             self.backend.resume()
             pb.state = State.PLAYING
@@ -272,6 +293,19 @@ class PlayerCore:
         if pb.index + 1 < len(pb.queue):
             self._load(pb.index + 1)
         else:
+            current = pb.current
+            if current and current.video_id:
+                log.info("queue ended; auto-fetching Up Next for %s", current.label)
+                try:
+                    next_tracks = up_next(self.client, current.video_id, limit=25, exclude_current=True)
+                    if next_tracks:
+                        old_len = len(pb.queue)
+                        pb.queue.extend(next_tracks)
+                        self._emit("message", f"queued {len(next_tracks)} Up Next tracks")
+                        self._load(old_len)
+                        return
+                except Exception as e:
+                    log.debug("auto-next up_next failed: %s", e)
             self._emit("end-of-queue")
             self._stop(emit=False)
 
@@ -319,5 +353,18 @@ class PlayerCore:
                 self._emit("message", f"{title}: empty")
         except TmusicError as e:
             log_exception(log, e, f"{title} failed")
+            self._emit("error", e.description)
+        self.playback.status_message = ""
+
+    def _do_up_next(self, track: Track) -> None:
+        self.playback.status_message = f"loading Up Next for: {track.title}"
+        try:
+            tracks = up_next(self.client, track.video_id, limit=30, exclude_current=True)
+            if tracks:
+                self._emit("results", f"Up Next for: {track.title}", tracks)
+            else:
+                self._emit("message", f"no Up Next tracks found for {track.title!r}")
+        except TmusicError as e:
+            log_exception(log, e, f"up_next failed for {track.title!r}")
             self._emit("error", e.description)
         self.playback.status_message = ""

@@ -59,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--index", type=int, default=1, help="which result to play (default 1)")
     pp.add_argument("--no-cover", action="store_true", help="disable album cover art display")
     pp.add_argument("--cover-style", choices=["braille", "halfblock", "native"], default="braille", help="cover art style")
+    pp.add_argument("--width", type=int, default=54, help="art width in characters (default 54, higher for finer dots)")
 
     qp = sub.add_parser("picks", help="browse or play personalized Quick picks")
     qp.add_argument("--limit", type=int, default=20, help="max items to return (default 20)")
@@ -66,11 +67,21 @@ def build_parser() -> argparse.ArgumentParser:
     qp.add_argument("--index", type=int, default=None, help="which Quick pick to play (1..N)")
     qp.add_argument("--no-cover", action="store_true", help="disable album cover art display")
     qp.add_argument("--cover-style", choices=["braille", "halfblock", "native"], default="braille", help="cover art style")
+    qp.add_argument("--width", type=int, default=54, help="art width in characters (default 54, higher for finer dots)")
 
     cp = sub.add_parser("cover", help="display high-definition album cover art in terminal")
     cp.add_argument("query", nargs="+")
-    cp.add_argument("--width", type=int, default=44, help="art width in characters (default 44)")
+    cp.add_argument("--width", type=int, default=54, help="art width in characters (default 54, higher for finer dots)")
     cp.add_argument("--style", choices=["braille", "halfblock", "native"], default="braille", help="rendering style")
+
+    up = sub.add_parser("upnext", aliases=["next"], help="show or play Up Next songs (radio recommendations for a song)")
+    up.add_argument("query", nargs="*", help="seed track name/search query")
+    up.add_argument("--limit", type=int, default=20, help="max items to return (default 20)")
+    up.add_argument("--play", action="store_true", help="play the first Up Next track immediately")
+    up.add_argument("--index", type=int, default=None, help="which Up Next track to play (1..N)")
+    up.add_argument("--no-cover", action="store_true", help="disable album cover art display")
+    up.add_argument("--cover-style", choices=["braille", "halfblock", "native"], default="braille", help="cover art style")
+    up.add_argument("--width", type=int, default=54, help="art width in characters (default 54, higher for finer dots)")
 
     sub.add_parser("run", help="launch the full-screen TUI (M2)")
     return p
@@ -219,7 +230,7 @@ def cmd_play(cfg, args) -> int:
     track = tracks[args.index - 1]
     print(f"playing: {track.label}")
     if not getattr(args, "no_cover", False):
-        _show_cover(track, getattr(args, "cover_style", "braille"))
+        _show_cover(track, getattr(args, "cover_style", "braille"), width=getattr(args, "width", 54))
     backend = MPVBackend(cfg)
     try:
         url, duration = get_stream_url(client, track)
@@ -249,7 +260,7 @@ def cmd_play(cfg, args) -> int:
     return 0
 
 
-def _show_cover(track, style: str = "braille", width: int = 44) -> None:
+def _show_cover(track, style: str = "braille", width: int = 54) -> None:
     try:
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -287,7 +298,7 @@ def cmd_picks(cfg, args) -> int:
         track = tracks[idx - 1]
         print(f"playing Quick pick: {track.label}")
         if not getattr(args, "no_cover", False):
-            _show_cover(track, getattr(args, "cover_style", "braille"))
+            _show_cover(track, getattr(args, "cover_style", "braille"), width=getattr(args, "width", 54))
         from .mpv_backend import MPVBackend
         from .ytm import get_stream_url
         backend = MPVBackend(cfg)
@@ -346,6 +357,74 @@ def cmd_cover(cfg, args) -> int:
     return 0
 
 
+def cmd_upnext(cfg, args) -> int:
+    from .models import fmt_time
+    from .ytm import search, up_next
+
+    client = _client_or_die(cfg)
+    query = " ".join(args.query).strip() if args.query else ""
+    if query:
+        tracks = search(client, query, limit=1)
+        if not tracks:
+            return _fail(f"no search results for {query!r}")
+        seed_track = tracks[0]
+    else:
+        from .ytm import quick_picks
+
+        try:
+            seeds = quick_picks(client, limit=1)
+            seed_track = seeds[0] if seeds else None
+        except Exception:
+            seed_track = None
+        if not seed_track:
+            return _fail("please provide a song name: tmusic upnext <song name>")
+
+    next_tracks = up_next(client, seed_track.video_id, limit=args.limit or 20, exclude_current=True)
+    if not next_tracks:
+        print(f"no Up Next tracks found for {seed_track.label}")
+        return 1
+
+    if args.play or args.index:
+        idx = args.index or 1
+        if idx < 1 or idx > len(next_tracks):
+            return _fail(f"--index {idx} out of range (1..{len(next_tracks)})")
+        track = next_tracks[idx - 1]
+        print(f"playing Up Next track: {track.label}")
+        if not getattr(args, "no_cover", False):
+            _show_cover(track, getattr(args, "cover_style", "braille"), width=getattr(args, "width", 54))
+        from .mpv_backend import MPVBackend
+        from .ytm import get_stream_url
+
+        backend = MPVBackend(cfg)
+        try:
+            url, duration = get_stream_url(client, track)
+            if duration and not track.duration_seconds:
+                track.duration_seconds = duration
+            backend.play(url)
+            backend.resume()
+            print(f"stream: {url[:80]}...")
+            print("mpv is running — press Ctrl+C here to stop.")
+            pos = 0.0
+            while backend.is_running():
+                time.sleep(0.5)
+                p = backend.position()
+                if p is not None:
+                    pos = p
+            print(f"\nfinished at {pos:.0f}s (mpv exited)")
+        except KeyboardInterrupt:
+            print("\nstopping...")
+        finally:
+            backend.shutdown()
+        return 0
+
+    print(f"=== YouTube Music — Up Next for: {seed_track.label} ===")
+    for i, t in enumerate(next_tracks, 1):
+        dur = f"[{fmt_time(t.duration_seconds)}]" if t.duration_seconds else ""
+        print(f"{i:2d}. {t.label}   {dur}")
+    print(f"\nplay one with: tmusic upnext {query or seed_track.title} --index N")
+    return 0
+
+
 # --------------------------------------------------------------------- run (TUI)
 
 def cmd_run(cfg, args) -> int:
@@ -382,6 +461,8 @@ def main(argv: list[str] | None = None) -> int:
         "search": lambda: cmd_search(cfg, args),
         "play": lambda: cmd_play(cfg, args),
         "picks": lambda: cmd_picks(cfg, args),
+        "upnext": lambda: cmd_upnext(cfg, args),
+        "next": lambda: cmd_upnext(cfg, args),
         "cover": lambda: cmd_cover(cfg, args),
         "run": lambda: cmd_run(cfg, args),
         None: lambda: (parser.print_help(), 0)[1],

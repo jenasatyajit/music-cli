@@ -15,6 +15,7 @@ cleaned up on start.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
@@ -24,6 +25,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
@@ -35,6 +37,171 @@ from .logging import get_logger
 log = get_logger("mpv")
 
 IPC_TIMEOUT = 5.0  # seconds for a control command to round-trip
+
+# Global registry of active MPV backends so atexit / console close can clean them up
+_ACTIVE_BACKENDS: weakref.WeakSet[MPVBackend] = weakref.WeakSet()
+_WINDOWS_JOB_HANDLE: int | None = None
+_WINDOWS_JOB_LOCK = threading.Lock()
+_CONSOLE_CTRL_HANDLER_INSTALLED = False
+_ORPHANS_CLEANED = False
+
+
+def _create_kill_on_close_job() -> int | None:
+    """Create a Windows Job Object configured with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+
+    When the parent process terminates for ANY reason (terminal closed, crash,
+    kill), Windows automatically closes the job handle, which triggers the Windows
+    kernel to terminate all child processes (mpv.exe) instantly.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", ctypes.c_uint32),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoCounters", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryLimit", ctypes.c_size_t),
+                ("PeakJobMemoryLimit", ctypes.c_size_t),
+            ]
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        JobObjectExtendedLimitInformation = 9
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        res = kernel32.SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not res:
+            kernel32.CloseHandle(job)
+            return None
+        return job
+    except Exception as e:
+        log.debug("could not create Windows Job Object: %s", e)
+        return None
+
+
+def _get_process_job() -> int | None:
+    global _WINDOWS_JOB_HANDLE
+    if sys.platform != "win32":
+        return None
+    with _WINDOWS_JOB_LOCK:
+        if _WINDOWS_JOB_HANDLE is None:
+            _WINDOWS_JOB_HANDLE = _create_kill_on_close_job()
+        return _WINDOWS_JOB_HANDLE
+
+
+def _cleanup_all_active_backends() -> None:
+    for b in list(_ACTIVE_BACKENDS):
+        try:
+            b.shutdown()
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_all_active_backends)
+
+
+def _install_console_ctrl_handler() -> None:
+    global _CONSOLE_CTRL_HANDLER_INSTALLED
+    if sys.platform != "win32" or _CONSOLE_CTRL_HANDLER_INSTALLED:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        HandlerRoutine = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+        def _handler(ctrl_type: int) -> bool:
+            # 0=CTRL_C, 1=CTRL_BREAK, 2=CTRL_CLOSE, 5=CTRL_LOGOFF, 6=CTRL_SHUTDOWN
+            _cleanup_all_active_backends()
+            return False
+
+        _handler._cb = HandlerRoutine(_handler)
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_handler._cb, True)
+        _CONSOLE_CTRL_HANDLER_INSTALLED = True
+    except Exception as e:
+        log.debug("failed to install console ctrl handler: %s", e)
+
+
+def _cleanup_stale_orphans_async() -> None:
+    global _ORPHANS_CLEANED
+    if sys.platform != "win32" or _ORPHANS_CLEANED:
+        return
+    _ORPHANS_CLEANED = True
+
+    def _worker():
+        try:
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name = 'mpv.exe'\" | Select-Object ProcessId, CommandLine | ConvertTo-Json",
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=5.0)
+            if not res.stdout.strip():
+                return
+            data = json.loads(res.stdout)
+            if isinstance(data, dict):
+                data = [data]
+            my_pid = os.getpid()
+            import re
+            for item in data:
+                cmdline = item.get("CommandLine") or ""
+                pid = item.get("ProcessId")
+                if "tmusic-" in cmdline and pid:
+                    m = re.search(r"tmusic-(\d+)-", cmdline)
+                    if m:
+                        parent_pid = int(m.group(1))
+                        if parent_pid != my_pid:
+                            check = subprocess.run(
+                                ["tasklist", "/FI", f"PID eq {parent_pid}"],
+                                capture_output=True,
+                                text=True,
+                            )
+                            if str(parent_pid) not in check.stdout:
+                                log.info("cleaning up orphaned mpv PID %s from dead parent %s", pid, parent_pid)
+                                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, name="mpv-orphan-cleaner", daemon=True).start()
 
 
 @dataclass
@@ -61,6 +228,8 @@ class MPVBackend:
         self._cmd_seq = 0
         self._started_at = 0.0
         self._start_offset = 0.0  # where we seeked on load (for position math fallback)
+        _ACTIVE_BACKENDS.add(self)
+        _install_console_ctrl_handler()
         log.info("mpv resolved: %s", self.mpv_path)
 
     # ------------------------------------------------------------------ lifecycle
@@ -99,12 +268,25 @@ class MPVBackend:
         ]
         log.debug("starting mpv: %s", " ".join(cmd))
         self._stopping = False
+        _cleanup_stale_orphans_async()
+        popen_kwargs = {}
+        if sys.platform != "win32":
+            popen_kwargs["preexec_fn"] = os.setsid
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            **popen_kwargs,
         )
+        job = _get_process_job()
+        if job and hasattr(self.proc, "_handle"):
+            try:
+                import ctypes
+
+                ctypes.windll.kernel32.AssignProcessToJobObject(job, int(self.proc._handle))
+            except Exception as e:
+                log.debug("failed to assign mpv to Job Object: %s", e)
         if not self._wait_ready():
             err_detail = ""
             if self.proc and self.proc.poll() is not None and self.proc.stderr:

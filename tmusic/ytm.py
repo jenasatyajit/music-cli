@@ -349,3 +349,31 @@ def watch_playlist(client: YTMusic, video_id: str, limit: int = 25) -> list[Trac
     data = _call(client, "get_watch_playlist", videoId=video_id, limit=limit)
     items = data.get("tracks", []) if isinstance(data, dict) else []
     return [t for t in (Track.from_ytm(it, source="context") for it in items) if t]
+
+
+def quick_picks(client: YTMusic, limit: int = 20) -> list[Track]:
+    """Fetch the user's personalized 'Quick picks' (or home recommendations)."""
+    home = _call(client, "get_home", limit=8)
+    for section in home:
+        title = section.get("title", "").lower()
+        if "quick pick" in title:
+            contents = section.get("contents", [])
+            tracks = [t for t in (Track.from_ytm(it, source="quick_picks") for it in contents) if t]
+            if tracks:
+                return tracks[:limit]
+
+    for section in home:
+        title = section.get("title", "").lower()
+        if any(keyword in title for keyword in ("listen again", "mixed for you", "trending songs", "for you")):
+            contents = section.get("contents", [])
+            tracks = [t for t in (Track.from_ytm(it, source="home") for it in contents) if t]
+            if tracks:
+                return tracks[:limit]
+
+    for section in home:
+        contents = section.get("contents", [])
+        tracks = [t for t in (Track.from_ytm(it, source="home") for it in contents) if t]
+        if tracks:
+            return tracks[:limit]
+
+    return []

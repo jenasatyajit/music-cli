@@ -57,6 +57,20 @@ def build_parser() -> argparse.ArgumentParser:
     pp = sub.add_parser("play", help="search and play the first result")
     pp.add_argument("query", nargs="+")
     pp.add_argument("--index", type=int, default=1, help="which result to play (default 1)")
+    pp.add_argument("--no-cover", action="store_true", help="disable album cover art display")
+    pp.add_argument("--cover-style", choices=["braille", "halfblock", "native"], default="braille", help="cover art style")
+
+    qp = sub.add_parser("picks", help="browse or play personalized Quick picks")
+    qp.add_argument("--limit", type=int, default=20, help="max items to return (default 20)")
+    qp.add_argument("--play", action="store_true", help="play the first Quick pick immediately")
+    qp.add_argument("--index", type=int, default=None, help="which Quick pick to play (1..N)")
+    qp.add_argument("--no-cover", action="store_true", help="disable album cover art display")
+    qp.add_argument("--cover-style", choices=["braille", "halfblock", "native"], default="braille", help="cover art style")
+
+    cp = sub.add_parser("cover", help="display high-definition album cover art in terminal")
+    cp.add_argument("query", nargs="+")
+    cp.add_argument("--width", type=int, default=44, help="art width in characters (default 44)")
+    cp.add_argument("--style", choices=["braille", "halfblock", "native"], default="braille", help="rendering style")
 
     sub.add_parser("run", help="launch the full-screen TUI (M2)")
     return p
@@ -204,6 +218,8 @@ def cmd_play(cfg, args) -> int:
         return _fail(f"--index {args.index} out of range (1..{len(tracks)})")
     track = tracks[args.index - 1]
     print(f"playing: {track.label}")
+    if not getattr(args, "no_cover", False):
+        _show_cover(track, getattr(args, "cover_style", "braille"))
     backend = MPVBackend(cfg)
     try:
         url, duration = get_stream_url(client, track)
@@ -233,6 +249,103 @@ def cmd_play(cfg, args) -> int:
     return 0
 
 
+def _show_cover(track, style: str = "braille", width: int = 44) -> None:
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        from .cover import display_cover_terminal, fetch_cover_bytes, render_colored_braille, render_colored_halfblock
+        data = fetch_cover_bytes(track.thumbnail_url, video_id=track.video_id)
+        if not data:
+            return
+        if style == "native":
+            display_cover_terminal(data, width=width, prefer_native=True)
+        elif style == "halfblock":
+            for line in render_colored_halfblock(data, width=width):
+                print(line)
+        else:
+            for line in render_colored_braille(data, width=width, dual_color=True):
+                print(line)
+    except Exception:
+        pass
+
+
+def cmd_picks(cfg, args) -> int:
+    from .models import fmt_time
+    from .ytm import is_authenticated, quick_picks
+
+    if not is_authenticated():
+        return _fail("Quick picks require login — run `tmusic auth cookies` first.")
+    client = _client_or_die(cfg)
+    tracks = quick_picks(client, limit=args.limit or 20)
+    if not tracks:
+        print("no Quick picks found right now")
+        return 1
+    if args.play or args.index:
+        idx = args.index or 1
+        if idx < 1 or idx > len(tracks):
+            return _fail(f"--index {idx} out of range (1..{len(tracks)})")
+        track = tracks[idx - 1]
+        print(f"playing Quick pick: {track.label}")
+        if not getattr(args, "no_cover", False):
+            _show_cover(track, getattr(args, "cover_style", "braille"))
+        from .mpv_backend import MPVBackend
+        from .ytm import get_stream_url
+        backend = MPVBackend(cfg)
+        try:
+            url, duration = get_stream_url(client, track)
+            if duration and not track.duration_seconds:
+                track.duration_seconds = duration
+            backend.play(url)
+            backend.resume()
+            print(f"stream: {url[:80]}...")
+            print("mpv is running — press Ctrl+C here to stop.")
+            pos = 0.0
+            while backend.is_running():
+                time.sleep(0.5)
+                p = backend.position()
+                if p is not None:
+                    pos = p
+            print(f"\nfinished at {pos:.0f}s (mpv exited)")
+        except KeyboardInterrupt:
+            print("\nstopping...")
+        finally:
+            backend.shutdown()
+        return 0
+
+    print("=== YouTube Music — Quick Picks ===")
+    for i, t in enumerate(tracks, 1):
+        print(f"{i:2d}. {t.label}   [{fmt_time(t.duration_seconds)}]")
+    print("\nplay one with: tmusic picks --index N")
+    return 0
+
+
+def cmd_cover(cfg, args) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    from .cover import display_cover_terminal, fetch_cover_bytes, render_colored_braille, render_colored_halfblock
+    from .ytm import search
+
+    client = _client_or_die(cfg)
+    query = " ".join(args.query)
+    tracks = search(client, query, limit=1)
+    if not tracks:
+        return _fail(f"no results for {query!r}")
+    track = tracks[0]
+    print(f"cover art: {track.label}")
+    data = fetch_cover_bytes(track.thumbnail_url, video_id=track.video_id)
+    if not data:
+        return _fail("could not download cover image")
+    if args.style == "native":
+        display_cover_terminal(data, width=args.width, prefer_native=True)
+    elif args.style == "halfblock":
+        for line in render_colored_halfblock(data, width=args.width):
+            print(line)
+    else:
+        for line in render_colored_braille(data, width=args.width, dual_color=True):
+            print(line)
+    return 0
+
+
 # --------------------------------------------------------------------- run (TUI)
 
 def cmd_run(cfg, args) -> int:
@@ -246,6 +359,11 @@ def cmd_run(cfg, args) -> int:
 # --------------------------------------------------------------------- dispatch
 
 def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     parser = build_parser()
     args = parser.parse_args(argv)
     log = setup_logging(args.verbose)
@@ -263,6 +381,8 @@ def main(argv: list[str] | None = None) -> int:
         "auth": lambda: _auth_dispatch(cfg, args),
         "search": lambda: cmd_search(cfg, args),
         "play": lambda: cmd_play(cfg, args),
+        "picks": lambda: cmd_picks(cfg, args),
+        "cover": lambda: cmd_cover(cfg, args),
         "run": lambda: cmd_run(cfg, args),
         None: lambda: (parser.print_help(), 0)[1],
     }

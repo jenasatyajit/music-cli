@@ -37,18 +37,19 @@ try:  # windows-curses provides a curses shim on win32
 except ImportError:  # pragma: no cover
     KEY_RESIZE = 410
 
-EQU_CHARS = "▁▂▃▄▅▆▇█"
+EQU_CHARS = " ▂▃▄▅▆▇█"
 
 
 def _eq_frame(seed: str, width: int, tick: int) -> str:
     """Deterministic pseudo-EQ: bars derived from seed + tick (cosmetic)."""
     out = []
+    n = len(EQU_CHARS)
     for i in range(width):
         h = 0
         s = f"{seed}:{i}:{tick // 3 % 97}"
         for ch in s:
             h = (h * 31 + ord(ch)) % 1000003
-        v = (h % 9)
+        v = h % n
         # smooth a bit with the neighbour phase
         out.append(EQU_CHARS[v])
     return "".join(out)
@@ -80,7 +81,7 @@ class TUIApp:
     def __init__(self, core: PlayerCore, authed: bool) -> None:
         self.core = core
         self.authed = authed
-        self.mode = "main"  # main | results | prompt | help
+        self.mode = "main"  # main | results | prompt | help | cover
         self.results: list[Track] = []
         self.results_title = ""
         self.results_cursor = 0
@@ -92,6 +93,9 @@ class TUIApp:
         self.status_until = 0.0
         self.tick = 0
         self._last_resize = 0.0
+        self._cover_cache: dict[str, list[str]] = {}
+        self._full_cover_cache: dict[str, list[str]] = {}
+        self._cover_fetching: set[str] = set()
 
     # ------------------------------------------------------------------ msgs
 
@@ -201,10 +205,34 @@ class TUIApp:
         if self.mode == "help":
             return "quit" if key in (ord("q"), 27, 10) else None
 
+        if self.mode == "cover":
+            if key in (ord("q"), 27, ord("c"), ord("C"), 10):
+                self.mode = "main"
+                return None
+            elif key in (ord(" "),):
+                self.core.toggle_pause()
+                return None
+            elif key in (ord("n"),):
+                self.core.next()
+                return None
+            elif key in (ord("p"),):
+                self.core.prev()
+                return None
+            elif key == curses.KEY_LEFT:
+                self.core.seek(-self.core.cfg.seek_seconds)
+                return None
+            elif key == curses.KEY_RIGHT:
+                self.core.seek(self.core.cfg.seek_seconds)
+                return None
+            return None
+
         if self.mode == "prompt":
             return self._key_prompt(key)
 
         if self.mode == "results":
+            if key in (ord("c"), ord("C")):
+                self.mode = "cover"
+                return None
             return self._key_results(key)
 
         # main
@@ -235,6 +263,10 @@ class TUIApp:
             self.prompt_scope = "library"
         elif key in (ord("l"),):
             self.core.list_library()
+        elif key in (ord("r"), ord("R")):
+            self.core.list_quick_picks()
+        elif key in (ord("c"), ord("C")):
+            self.mode = "cover"
         elif key in (ord("m"),):
             self.core.list_liked()
         elif key in (ord("?"),):
@@ -322,6 +354,9 @@ class TUIApp:
         if self.mode == "help":
             self._draw_help(stdscr, h, w)
             return
+        if self.mode == "cover":
+            self._draw_cover_view(stdscr, h, w)
+            return
         self._draw_header(stdscr, h, w)
         self._draw_nowplaying(stdscr, h, w)
         if self.mode == "results":
@@ -355,6 +390,10 @@ class TUIApp:
             _safe_write(stdscr, y, 18, _clip(track.label, w - 22), curses.A_BOLD)
             if track.album:
                 _safe_write(stdscr, y + 1, 18, _clip(track.album, w - 22), curses.A_DIM)
+
+            # Trigger background cover fetch
+            if track.video_id and track.video_id not in self._cover_cache and track.video_id not in self._cover_fetching:
+                self._fetch_cover_async(track.video_id, track.thumbnail_url)
         else:
             _safe_write(stdscr, y, 4, "♪ nothing playing — / to search", curses.A_DIM)
 
@@ -379,38 +418,166 @@ class TUIApp:
         elif pb.state == State.ERROR and pb.status_message:
             _safe_write(stdscr, ty + 1, 2, _clip("✖ " + pb.status_message, w - 2), self.C_RED)
 
+    def _draw_cover_panel(self, stdscr, h: int, w: int, px: int, pw: int, py: int, max_h: int) -> None:
+        pb = self.core.snapshot()
+        track = pb.current
+        if not track or pw < 18 or max_h < 8:
+            return
+
+        # Top border
+        title_box = " Album Art "
+        dash1 = max(0, pw - len(title_box) - 3)
+        _safe_write(stdscr, py, px, "┌─" + title_box + "─" * dash1 + "┐", curses.A_BOLD | self.C_CYAN)
+
+        art_lines = self._cover_cache.get(track.video_id, [])
+        art_w = len(art_lines[0]) if art_lines else 0
+        art_offset_x = px + max(1, (pw - art_w) // 2)
+
+        row = 1
+        available_art_h = min(len(art_lines), max(3, max_h - 6))
+        if art_lines:
+            for i in range(available_art_h):
+                _safe_write(stdscr, py + row, px, "│", self.C_CYAN)
+                _safe_write(stdscr, py + row, art_offset_x, art_lines[i][: pw - 2], curses.A_BOLD | self.C_CYAN)
+                _safe_write(stdscr, py + row, px + pw - 1, "│", self.C_CYAN)
+                row += 1
+        else:
+            _safe_write(stdscr, py + row, px, "│", self.C_CYAN)
+            _safe_write(stdscr, py + row, px + max(1, (pw - 16) // 2), "… loading art …", curses.A_DIM)
+            _safe_write(stdscr, py + row, px + pw - 1, "│", self.C_CYAN)
+            row += 1
+
+        # Mid divider
+        sub_title = " Now Playing "
+        dash2 = max(0, pw - len(sub_title) - 3)
+        _safe_write(stdscr, py + row, px, "├─" + sub_title + "─" * dash2 + "┤", self.C_CYAN)
+        row += 1
+
+        # Track metadata lines
+        text_w = max(4, pw - 4)
+        if row < max_h - 1:
+            _safe_write(stdscr, py + row, px, "│", self.C_CYAN)
+            _safe_write(stdscr, py + row, px + 2, _clip(track.title, text_w), curses.A_BOLD)
+            _safe_write(stdscr, py + row, px + pw - 1, "│", self.C_CYAN)
+            row += 1
+
+        if track.artists and row < max_h - 1:
+            _safe_write(stdscr, py + row, px, "│", self.C_CYAN)
+            _safe_write(stdscr, py + row, px + 2, _clip(track.artists, text_w), self.C_GREEN)
+            _safe_write(stdscr, py + row, px + pw - 1, "│", self.C_CYAN)
+            row += 1
+
+        # Pad remaining space
+        while row < max_h - 1:
+            _safe_write(stdscr, py + row, px, "│", self.C_CYAN)
+            _safe_write(stdscr, py + row, px + pw - 1, "│", self.C_CYAN)
+            row += 1
+
+        # Bottom border
+        hint = " 'c' full "
+        dash3 = max(0, pw - len(hint) - 3)
+        _safe_write(stdscr, py + row, px, "└──" + hint + "─" * dash3 + "┘", curses.A_DIM | self.C_CYAN)
+
+    def _draw_cover_view(self, stdscr, h: int, w: int) -> None:
+        pb = self.core.snapshot()
+        track = pb.current
+
+        # Header
+        hdr = f" tmusic v{__version__} ─ Album Cover Art "
+        hint = "[ press 'c' or Esc to return ]"
+        mid = max(0, w - len(hdr) - len(hint))
+        _safe_write(stdscr, 0, 0, hdr + "─" * mid, curses.A_BOLD | self.C_CYAN)
+        _safe_write(stdscr, 0, w - len(hint), hint, self.C_CYAN)
+
+        if not track:
+            _safe_write(stdscr, h // 2, max(2, w // 2 - 14), "♪ No track currently playing", curses.A_DIM)
+            return
+
+        art_lines = self._full_cover_cache.get(track.video_id, [])
+        if not art_lines and track.video_id not in self._cover_fetching:
+            self._fetch_cover_async(track.video_id, track.thumbnail_url)
+
+        art_w = len(art_lines[0]) if art_lines else 0
+        art_h = len(art_lines)
+
+        avail_h = max(4, h - 8)
+        draw_h = min(art_h, avail_h)
+        start_y = max(2, (avail_h - draw_h) // 2 + 1)
+        start_x = max(1, (w - art_w) // 2)
+
+        if art_lines:
+            for idx in range(draw_h):
+                _safe_write(stdscr, start_y + idx, start_x, art_lines[idx][: w - 2], curses.A_BOLD | self.C_CYAN)
+        else:
+            _safe_write(stdscr, start_y + 2, max(2, w // 2 - 12), "… loading album art …", curses.A_DIM)
+
+        meta_y = start_y + draw_h + 1
+        if meta_y < h - 4:
+            _safe_write(stdscr, meta_y, max(1, (w - len(track.title)) // 2), _clip(track.title, w - 2), curses.A_BOLD)
+            meta_y += 1
+        if track.artists and meta_y < h - 3:
+            art_text = f"by {track.artists}" + (f"  ·  {track.album}" if track.album else "")
+            _safe_write(stdscr, meta_y, max(1, (w - len(art_text)) // 2), _clip(art_text, w - 2), self.C_GREEN)
+            meta_y += 1
+
+        dur = track.duration_seconds if track else 0.0
+        if dur <= 0 and pb.state == State.PLAYING and pb.position > 0:
+            dur = pb.position
+        pos_txt = fmt_time(pb.position)
+        dur_txt = fmt_time(dur)
+        bar_w = max(12, min(w - 28, 44))
+        bar = _bar(pb.position, dur, bar_w) if dur > 0 else "─" * bar_w
+        line = f"{pos_txt:>7} ──[{bar}]─ {dur_txt}"
+        bx = max(1, (w - len(line)) // 2)
+        _safe_write(stdscr, h - 3, bx, line, self.C_GREEN)
+
+        state_str = "▶ PLAYING" if pb.state == State.PLAYING else ("⏸ PAUSED" if pb.state == State.PAUSED else "")
+        foot = f" {state_str}  ·  space=pause  n=next  p=prev  ←/→=seek  c/Esc=return "
+        _safe_write(stdscr, h - 1, max(0, (w - len(foot)) // 2), _clip(foot, w - 1), curses.A_DIM)
+
     def _draw_queue(self, stdscr, h: int, w: int) -> None:
         pb = self.core.snapshot()
         qy = 7
+        has_panel = (w >= 84 and h >= 18 and pb.current is not None)
+        panel_w = min(32, max(26, w - 58)) if has_panel else 0
+        list_w = (w - panel_w - 3) if has_panel else w
+        list_h = max(3, h - qy - 3)
+
         _safe_write(stdscr, qy, 0, f" queue ({len(pb.queue)})", curses.A_BOLD | self.C_CYAN)
         if not pb.queue:
             _safe_write(stdscr, qy + 1, 2, "empty — / search then Enter to play", curses.A_DIM)
-            return
-        list_h = max(3, h - qy - 3)
-        if self.scroll > len(pb.queue) - 1:
-            self.scroll = max(0, len(pb.queue) - 1)
-        for row in range(list_h):
-            idx = self.scroll + row
-            if idx >= len(pb.queue):
-                break
-            t = pb.queue[idx]
-            marker = ">" if idx == pb.index else " "
-            attr = 0
-            if idx == pb.index:
-                attr = curses.A_BOLD | self.C_GREEN
-            if idx == self.cursor and self.cursor != pb.index:
-                attr = curses.A_REVERSE
-            dur_t = f"{fmt_time(t.duration_seconds)}" if t.duration_seconds else ""
-            _safe_write(stdscr, qy + 1 + row, 0, f" {marker}", attr)
-            _safe_write(stdscr, qy + 1 + row, 3, _clip(t.label, w - 14), attr)
-            _safe_write(stdscr, qy + 1 + row, w - 9, dur_t, attr)
+        else:
+            if self.scroll > len(pb.queue) - 1:
+                self.scroll = max(0, len(pb.queue) - 1)
+            for row in range(list_h):
+                idx = self.scroll + row
+                if idx >= len(pb.queue):
+                    break
+                t = pb.queue[idx]
+                marker = ">" if idx == pb.index else " "
+                attr = 0
+                if idx == pb.index:
+                    attr = curses.A_BOLD | self.C_GREEN
+                if idx == self.cursor and self.cursor != pb.index:
+                    attr = curses.A_REVERSE
+                dur_t = f"{fmt_time(t.duration_seconds)}" if t.duration_seconds else ""
+                _safe_write(stdscr, qy + 1 + row, 0, f" {marker}", attr)
+                _safe_write(stdscr, qy + 1 + row, 3, _clip(t.label, list_w - 14), attr)
+                _safe_write(stdscr, qy + 1 + row, list_w - 9, dur_t, attr)
+
+        if has_panel:
+            self._draw_cover_panel(stdscr, h, w, w - panel_w - 1, panel_w, qy, list_h + 2)
 
     def _draw_results(self, stdscr, h: int, w: int) -> None:
+        pb = self.core.snapshot()
         ry = 6
-        _safe_write(stdscr, ry, 0, _clip(f" {self.results_title} ({len(self.results)})", w - 1),
-                    curses.A_BOLD | self.C_CYAN)
-        _safe_write(stdscr, ry, 0, " ", 0)
+        has_panel = (w >= 84 and h >= 18 and pb.current is not None)
+        panel_w = min(32, max(26, w - 58)) if has_panel else 0
+        list_w = (w - panel_w - 3) if has_panel else w
         list_h = max(3, h - ry - 4)
+
+        _safe_write(stdscr, ry, 0, _clip(f" {self.results_title} ({len(self.results)})", list_w - 1),
+                    curses.A_BOLD | self.C_CYAN)
         if self.results_cursor < self.scroll:
             self.scroll = self.results_cursor
         elif self.results_cursor >= self.scroll + list_h:
@@ -426,9 +593,12 @@ class TUIApp:
             attr = curses.A_REVERSE if idx == self.results_cursor else 0
             dur_t = f"{fmt_time(t.duration_seconds)}" if t.duration_seconds else ""
             _safe_write(stdscr, ry + 1 + row, 0, f" {marker}", attr)
-            _safe_write(stdscr, ry + 1 + row, 3, _clip(t.label, w - 14), attr)
-            _safe_write(stdscr, ry + 1 + row, w - 9, dur_t, attr)
-        _safe_write(stdscr, ry + list_h + 1, 0, " Enter=play s=play all a=add to queue esc=back", curses.A_DIM)
+            _safe_write(stdscr, ry + 1 + row, 3, _clip(t.label, list_w - 14), attr)
+            _safe_write(stdscr, ry + 1 + row, list_w - 9, dur_t, attr)
+        _safe_write(stdscr, ry + list_h + 1, 0, _clip(" Enter=play s=play all a=add to queue esc=back", list_w - 1), curses.A_DIM)
+
+        if has_panel:
+            self._draw_cover_panel(stdscr, h, w, w - panel_w - 1, panel_w, ry, list_h + 2)
 
     def _draw_status(self, stdscr, h: int, w: int) -> None:
         if self.mode == "prompt":
@@ -440,7 +610,7 @@ class TUIApp:
         y = h - 1
         now = time.monotonic()
         status = self.status if now < self.status_until else ""
-        base = " space=pause n=next p=prev ←/→=seek l=library m=liked d=del ?=help q=quit"
+        base = " space=pause n=next p=prev r=picks c=cover ←/→=seek l=library m=liked d=del ?=help q=quit"
         if status:
             _safe_write(stdscr, y, 0, _clip(" " + status + "  ", w - len(base) - 1), self.C_YELLOW)
             _safe_write(stdscr, y, w - len(base), _clip(base, len(base)), curses.A_DIM)
@@ -456,8 +626,10 @@ class TUIApp:
             "  x                stop",
             "  ← / →            seek 10s        PgUp / PgDn  seek 30s",
             "  mouse click      seek (on the progress line)",
+            "  c                view high-definition album cover art",
             "  /                search public catalogue",
             "  L                search your library",
+            "  r                load quick picks (recommendations)",
             "  l                load your library",
             "  m                load your liked songs",
             "  j / k or ↑ / ↓   move cursor     d  delete from queue",
@@ -471,6 +643,25 @@ class TUIApp:
                         curses.A_BOLD if i == 0 else 0)
         _safe_write(stdscr, y0 + len(rows) + 1, max(1, w // 2 - 20),
                     "(any key to close)", curses.A_DIM)
+
+    def _fetch_cover_async(self, video_id: str, url: str) -> None:
+        import threading
+        from .cover import fetch_cover_bytes, render_curses_braille
+
+        self._cover_fetching.add(video_id)
+
+        def _worker():
+            try:
+                data = fetch_cover_bytes(url, video_id=video_id)
+                if data:
+                    self._cover_cache[video_id] = render_curses_braille(data, width=26)
+                    self._full_cover_cache[video_id] = render_curses_braille(data, width=44)
+            except Exception:
+                pass
+            finally:
+                self._cover_fetching.discard(video_id)
+
+        threading.Thread(target=_worker, name="cover-fetch", daemon=True).start()
 
 
 def run_tui(cfg) -> int:

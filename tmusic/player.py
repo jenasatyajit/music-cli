@@ -24,7 +24,7 @@ from .errors import TmusicError
 from .logging import get_logger, log_exception
 from .models import Playback, State, Track
 from .mpv_backend import MPVBackend
-from .ytm import get_stream_url, library_songs, liked_songs, search
+from .ytm import get_stream_url, library_songs, liked_songs, quick_picks, search
 
 log = get_logger("player")
 
@@ -147,6 +147,9 @@ class PlayerCore:
     def list_library(self) -> None:
         self._cmd_q.put(("library",))
 
+    def list_quick_picks(self) -> None:
+        self._cmd_q.put(("quick_picks",))
+
     # ------------------------------------------------------------------ worker
 
     def _emit(self, kind: str, *payload) -> None:
@@ -203,6 +206,8 @@ class PlayerCore:
             self._do_listing("liked_songs", "Your liked songs")
         elif kind == "library":
             self._do_listing("library_songs", "Your library")
+        elif kind == "quick_picks":
+            self._do_listing("quick_picks", "Quick picks")
 
     # ------------------------------------------------------------------ transitions
 
@@ -303,6 +308,7 @@ class PlayerCore:
         fn = {
             "liked_songs": lambda: liked_songs(self.client, limit=100),
             "library_songs": lambda: library_songs(self.client, limit=100),
+            "quick_picks": lambda: quick_picks(self.client, limit=25),
         }[fn_name]
         self.playback.status_message = f"loading: {title}"
         try:

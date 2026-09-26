@@ -31,6 +31,14 @@ def test_fmt_time_basic():
     assert fmt_time(-3) == "--:--"
 
 
+def test_eq_frame_no_index_error():
+    from tmusic.tui import _eq_frame
+
+    for tick in range(300):
+        frame = _eq_frame("test_seed", 12, tick)
+        assert len(frame) == 12
+
+
 # ---------------------------------------------------------------- Track
 
 def test_track_from_ytm_song():

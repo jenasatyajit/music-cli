@@ -60,13 +60,20 @@ class Track:
             duration = int(duration) if duration else 0.0
         except (TypeError, ValueError):
             duration = 0.0
+        thumb = ""
+        if isinstance(item.get("thumbnails"), list) and item["thumbnails"]:
+            thumb = str(item["thumbnails"][-1].get("url", ""))
+        elif isinstance(item.get("thumbnail"), dict):
+            thumb = str(item["thumbnail"].get("url", ""))
+        if not thumb and video_id:
+            thumb = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
         return cls(
             video_id=video_id,
             title=item.get("title", "?"),
             artists=artists,
             album=item.get("album", {}).get("text", "") if isinstance(item.get("album"), dict) else "",
             duration_seconds=float(duration or 0.0),
-            thumbnail_url=item.get("thumbnail", {}).get("url", "") if isinstance(item.get("thumbnail"), dict) else "",
+            thumbnail_url=thumb,
             source=source,
         )
 

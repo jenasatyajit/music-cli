@@ -159,6 +159,7 @@ def find_mpv(cfg: Config) -> str:
         tried.append(cfg.mpv_path)
         if Path(cfg.mpv_path).is_file():
             return cfg.mpv_path
+        raise MissingMpv(tried)
 
     if sys.platform == "win32":
         # explicit .exe first (PATH and common install locations)

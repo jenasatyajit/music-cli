@@ -51,10 +51,13 @@ class MPVBackend:
         self.proc: subprocess.Popen | None = None
         self.events: Queue[MPVEvent] = Queue()
         self._reader: threading.Thread | None = None
+        self._stderr_drain: threading.Thread | None = None
         self._ipc: str | None = None
         self._sock_path: Path | None = None
         self._paused = False
         self._lock = threading.RLock()
+        self._ipc_lock = threading.RLock()
+        self._stopping = False
         self._cmd_seq = 0
         self._started_at = 0.0
         self._start_offset = 0.0  # where we seeked on load (for position math fallback)
@@ -85,46 +88,71 @@ class MPVBackend:
                 pass
         cmd = [
             self.mpv_path,
-            f"--input-ipc={ipc}",
+            f"--input-ipc-server={ipc}",
+            "--idle=yes",
             "--no-video",
             "--no-terminal",  # silence stdout noise; we use IPC
             "--really-quiet",
             "--keep-open=no",
             "--pause",  # start paused; the player calls resume() on purpose
             "--no-config",
-            "--force-rgba",  # no-op without video, harmless
         ]
         log.debug("starting mpv: %s", " ".join(cmd))
+        self._stopping = False
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        if not self._wait_ready():
+            err_detail = ""
+            if self.proc and self.proc.poll() is not None and self.proc.stderr:
+                try:
+                    err_bytes = self.proc.stderr.read()
+                    if err_bytes:
+                        err_detail = f": {err_bytes.decode('utf-8', errors='replace').strip()}"
+                except Exception:
+                    pass
+            self._stop_process()
+            raise MPVProcessError(f"mpv did not open its IPC socket{err_detail}")
+
         self._reader = threading.Thread(target=self._read_loop, name="mpv-ipc", daemon=True)
         self._reader.start()
-        if not self._wait_ready():
-            self._stop_process()
-            raise MPVProcessError("mpv did not open its IPC socket")
+        self._stderr_drain = threading.Thread(target=self._drain_stderr, name="mpv-stderr", daemon=True)
+        self._stderr_drain.start()
+
+    def _drain_stderr(self) -> None:
+        proc = self.proc
+        if proc and proc.stderr:
+            try:
+                for line in proc.stderr:
+                    if line:
+                        log.debug("mpv stderr: %s", line.decode("utf-8", errors="replace").strip())
+            except Exception:
+                pass
 
     def _wait_ready(self, timeout: float = 8.0) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
+            if self.proc and self.proc.poll() is not None:
                 return False
             if self._ipc is not None and self._send("get_property", "idle-active", timeout=0.4):
                 return True
+            time.sleep(0.05)
         return False
 
     def shutdown(self) -> None:
         self._stop_process()
 
     def _stop_process(self, quiet: bool = False) -> None:
+        self._stopping = True
         with self._lock:
-            proc, self.proc = self.proc, None
+            proc = self.proc
+            self.proc = None
         if proc and proc.poll() is None:
             try:
-                self._send("quit", timeout=1.5)
+                self._send_raw(["quit"], timeout=1.0)
             except Exception:
                 pass
             try:
@@ -140,89 +168,96 @@ class MPVBackend:
         if self._reader:
             self._reader.join(timeout=1.0)
             self._reader = None
+        if self._stderr_drain:
+            self._stderr_drain.join(timeout=0.5)
+            self._stderr_drain = None
         if self._sock_path:
             try:
                 self._sock_path.unlink(missing_ok=True)
             except OSError:
                 pass
             self._sock_path = None
+        self._ipc = None
+        self._stopping = False
 
     # ------------------------------------------------------------------ IPC plumbing
+
+    def _send_raw(self, cmd: list, timeout: float = IPC_TIMEOUT) -> bool:
+        if not self._ipc:
+            return False
+        self._cmd_seq += 1
+        payload = json.dumps({"command": cmd, "request_id": self._cmd_seq}) + "\n"
+        with self._ipc_lock:
+            try:
+                if sys.platform == "win32":
+                    f = self._win_connect(timeout)
+                    f.sendall(payload.encode("utf-8"))
+                    f.close()
+                else:
+                    import socket
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.settimeout(timeout)
+                    s.connect(self._ipc)
+                    s.sendall(payload.encode("utf-8"))
+                    s.close()
+                return True
+            except OSError as e:
+                log.debug("IPC send_raw failed (%s): %s", cmd, e)
+                return False
 
     def _send(self, command: str, *args, timeout: float = IPC_TIMEOUT) -> dict | None:
         """Send a command; None on any transport failure (caller decides)."""
         if self.proc is None or self.proc.poll() is not None:
             return None
-        self._cmd_seq += 1
-        payload = json.dumps({"command": [command, *args], "request_id": self._cmd_seq})
-        try:
-            if sys.platform == "win32":
-                f = self._win_connect(timeout)
-                f.sendall(payload.encode() + b"\n")
-                f.close()
-            else:
-                import socket
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.settimeout(timeout)
-                s.connect(self._ipc)
-                s.sendall(payload.encode() + b"\n")
-                s.close()
-        except OSError as e:
-            log.debug("IPC send failed (%s): %s", command, e)
-            return None
-        # We do not match request_ids (mpv would reply to every command); the
-        # transport is fire-and-verified-via-property where it matters.
-        return {"sent": True}
+        ok = self._send_raw([command, *args], timeout=timeout)
+        return {"sent": True} if ok else None
 
     def _get_property(self, name: str, timeout: float = IPC_TIMEOUT) -> dict | None:
-        """get_property with response matching. Uses a persistent connection."""
-        if self.proc is None or self.proc.poll() is not None:
+        """get_property with response matching."""
+        if self.proc is None or self.proc.poll() is not None or not self._ipc:
             return None
         self._cmd_seq += 1
         rid = self._cmd_seq
-        payload = json.dumps({"command": ["get_property", name], "request_id": rid})
-        try:
-            if sys.platform == "win32":
-                import socket  # noqa: F401
-                s = self._win_connect(timeout)
-            else:
-                import socket
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.settimeout(timeout)
-                s.connect(self._ipc)
-            s.sendall(payload.encode() + b"\n")
-            buf = b""
-            s.settimeout(timeout)
-            while True:
-                chunk = s.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-                for line in buf.split(b"\n"):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if msg.get("request_id") == rid:
-                        s.close()
-                        return msg
-        except (OSError, json.JSONDecodeError) as e:
-            log.debug("get_property(%s) failed: %s", name, e)
-            return None
+        payload = json.dumps({"command": ["get_property", name], "request_id": rid}) + "\n"
+        with self._ipc_lock:
+            try:
+                if sys.platform == "win32":
+                    s = self._win_connect(timeout)
+                else:
+                    import socket
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.settimeout(timeout)
+                    s.connect(self._ipc)
+                try:
+                    s.sendall(payload.encode("utf-8"))
+                    buf = b""
+                    s.settimeout(timeout)
+                    while True:
+                        chunk = s.recv(65536)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        for line in buf.split(b"\n"):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                msg = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if msg.get("request_id") == rid:
+                                return msg
+                finally:
+                    s.close()
+            except (OSError, json.JSONDecodeError) as e:
+                log.debug("get_property(%s) failed: %s", name, e)
+                return None
         return None
 
     def _win_connect(self, timeout: float) -> "object":
-        import socket
-
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # placeholder; replaced below
-        s.close()
         # Windows named pipe: plain file open is the reliable path.
         class _PipeFile:
             def __init__(self, path: str):
-                import msvcrt  # noqa: F401
                 self.f = open(path, "w+", encoding="utf-8", newline="")
 
             def sendall(self, b: bytes) -> None:
@@ -237,27 +272,43 @@ class MPVBackend:
                 pass
 
             def close(self) -> None:
-                self.f.close()
+                try:
+                    self.f.close()
+                except Exception:
+                    pass
 
         return _PipeFile(self._ipc)
 
     def _read_loop(self) -> None:
         """Consume mpv's async events; surface interesting ones as MPVEvent."""
-        import socket
+        conn = None
+        deadline = time.monotonic() + 5.0
+        while not self._stopping and self.proc is not None and self.proc.poll() is None and time.monotonic() < deadline:
+            try:
+                if sys.platform == "win32":
+                    conn = self._win_connect(timeout=5.0)
+                else:
+                    import socket
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sock.settimeout(1.0)
+                    sock.connect(self._ipc)
+                    conn = sock
+                break
+            except OSError:
+                time.sleep(0.05)
+        if conn is None:
+            log.debug("IPC reader could not connect")
+            return
 
         try:
-            if sys.platform == "win32":
-                conn = self._win_connect(timeout=5.0)
-            else:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(1.0)
-                sock.connect(self._ipc)
-                conn = sock
-            while self.proc is not None and self.proc.poll() is None:
-                line = conn.recv(65536)
-                if not line:
+            buf = b""
+            while not self._stopping and self.proc is not None and self.proc.poll() is None:
+                chunk = conn.recv(65536)
+                if not chunk:
                     break
-                for raw in line.split(b"\n"):
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
                     raw = raw.strip()
                     if not raw:
                         continue
@@ -278,13 +329,16 @@ class MPVBackend:
         except OSError as e:
             log.debug("IPC reader loop ended: %s", e)
         finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            if self.proc is not None and self.proc.poll() is not None:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if not self._stopping and self.proc is not None and self.proc.poll() is not None:
                 rc = self.proc.returncode
-                self.events.put(MPVEvent("crash", reason=f"exit code {rc}"))
+                if rc != 0:
+                    self.events.put(MPVEvent("crash", reason=f"exit code {rc}"))
+
 
     # ------------------------------------------------------------------ player-facing API
 

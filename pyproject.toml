@@ -8,6 +8,7 @@ dependencies = [
     "ytmusicapi>=1.12,<2",
     "yt-dlp>=2026.1.1",
     "requests>=2.31",
+    "pillow>=10.0",
     "windows-curses>=2.3.0; sys_platform == 'win32'",
 ]
 
